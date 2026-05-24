@@ -1,12 +1,13 @@
-"""Telegram Bot notifier for sending real-time price alerts."""
+"""Telegram Bot notifier — async via httpx for real-time price alerts."""
 
 from __future__ import annotations
 
-import json
+import asyncio
 import logging
 import time
-import urllib.request
 from datetime import datetime
+
+import httpx
 
 from stock_monitor.utils import market_currency
 
@@ -14,16 +15,15 @@ logger = logging.getLogger("stock_monitor.notifiers.telegram")
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 
-# ── Retry constants ──────────────────────────────────────────────
 _SEND_MAX_RETRIES = 3
-_SEND_BASE_DELAY = 1.0  # seconds
+_SEND_BASE_DELAY = 1.0
 
 
 class TelegramNotifier:
-    """Sends price-alert messages via a Telegram Bot.
+    """Sends price-alert messages via a Telegram Bot (async httpx).
 
-    Uses the Telegram Bot API directly (stdlib urllib — no extra dependency).
-    Messages are rate-limited per symbol+field to avoid flooding the chat.
+    Uses the Telegram Bot API with the shared ``httpx.AsyncClient``.
+    Messages are rate-limited per symbol+field to avoid flooding.
 
     Args:
         bot_token: Telegram Bot token from @BotFather.
@@ -32,16 +32,18 @@ class TelegramNotifier:
 
     Usage::
 
-        tg = TelegramNotifier(bot_token="...", chat_id="123456")
-        tg.send_alert("NVDA", "price", ">", 230.0, 235.67)
+        tg = TelegramNotifier(client, bot_token="...", chat_id="123456")
+        await tg.send_alert("NVDA", "price", ">", 230.0, 235.67)
     """
 
     def __init__(
         self,
+        client: httpx.AsyncClient,
         bot_token: str,
         chat_id: str,
         cooldown_seconds: int = 60,
     ) -> None:
+        self._client = client
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.cooldown_seconds = cooldown_seconds
@@ -53,9 +55,9 @@ class TelegramNotifier:
         else:
             logger.warning("Telegram bot_token or chat_id missing — disabled")
 
-    # ── Public API ────────────────────────────────────────────────
+    # ── Public API ────────────────────────────────────────────────────
 
-    def send_alert(
+    async def send_alert(
         self,
         symbol: str,
         field: str,
@@ -64,14 +66,10 @@ class TelegramNotifier:
         current_value: float,
         market: str = "us",
     ) -> bool:
-        """Send a price alert to Telegram, respecting cooldown.
-
-        Returns True if the message was sent, False if suppressed.
-        """
+        """Send a price alert to Telegram, respecting cooldown."""
         if not self._available:
             return False
 
-        # Cooldown check per symbol+field+operator+threshold
         key = f"{symbol}:{field}:{operator}:{threshold}"
         now = time.time()
         last = self._last_sent.get(key, 0)
@@ -83,8 +81,7 @@ class TelegramNotifier:
         text = self._build_alert_message(
             symbol, field, operator, threshold, current_value, currency,
         )
-
-        ok = self._send_with_retry(text)
+        ok = await self._send_with_retry(text)
         if ok:
             self._last_sent[key] = now
             logger.info(
@@ -93,27 +90,24 @@ class TelegramNotifier:
             )
         return ok
 
-    def send_test(self) -> bool:
-        """Send a one-shot test message to verify bot connectivity.
-
-        Returns True if the test message was delivered successfully.
-        """
+    async def send_test(self) -> bool:
+        """Send a one-shot test message to verify bot connectivity."""
         if not self._available:
             logger.warning("Cannot send test — Telegram credentials not configured")
             return False
 
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         text = (
-            "✅ *StockPulse — 测试成功*\n\n"
-            f"您的 Telegram Bot 已正确配置并成功连接。\n\n"
+            "✅ *StockPulse — Async Test*\n\n"
+            f"Your Telegram Bot is correctly configured.\n\n"
             f"• Bot Token: `{self._mask_token()}`\n"
             f"• Chat ID: `{self.chat_id}`\n"
-            f"• 时间: `{ts}`\n\n"
-            "ℹ️ 当股票价格触发告警阈值时，您将在此收到实时通知。"
+            f"• Time: `{ts}`\n\n"
+            "ℹ️ You will receive real-time notifications here when price alerts trigger."
         )
-        return self._send_with_retry(text)
+        return await self._send_with_retry(text)
 
-    # ── Message builders ──────────────────────────────────────────
+    # ── Message builders ──────────────────────────────────────────────
 
     def _build_alert_message(
         self,
@@ -131,22 +125,22 @@ class TelegramNotifier:
             val_str = f"{currency}{current_value:.2f}"
             thr_str = f"{currency}{threshold:.2f}"
             field_label = "价格"
-            field_emoji = "\U0001f4b0"  # 💰
+            field_emoji = "\U0001f4b0"
         elif field == "change_pct":
             val_str = f"{current_value:+.2f}%"
             thr_str = f"{threshold:+.2f}%"
             field_label = "涨跌幅"
-            field_emoji = "\U0001f4c8"  # 📈
+            field_emoji = "\U0001f4c8"
         elif field == "volume":
             val_str = f"{current_value:,.0f}"
             thr_str = f"{threshold:,.0f}"
             field_label = "成交量"
-            field_emoji = "\U0001f4ca"  # 📊
+            field_emoji = "\U0001f4ca"
         else:
             val_str = f"{current_value:.4f}"
             thr_str = f"{threshold:.4f}"
             field_label = field
-            field_emoji = "\U0001f514"  # 🔔
+            field_emoji = "\U0001f514"
 
         direction_emoji = "\U0001f7e2" if current_value >= threshold else "\U0001f534"
 
@@ -166,18 +160,15 @@ class TelegramNotifier:
             return t[:8] + "***" + t[-4:]
         return "***"
 
-    # ── HTTP transport ────────────────────────────────────────────
+    # ── Async HTTP transport ──────────────────────────────────────────
 
-    def _send_with_retry(self, text: str) -> bool:
-        """Post a message to Telegram with up to N retries on failure.
-
-        Returns True once the API responds 200, False if all retries exhausted.
-        """
+    async def _send_with_retry(self, text: str) -> bool:
+        """Post to Telegram with async retry on failure."""
         last_error: str | None = None
 
         for attempt in range(_SEND_MAX_RETRIES):
             try:
-                if self._post_message(text):
+                if await self._post_message(text):
                     return True
             except Exception as exc:
                 last_error = str(exc)
@@ -190,7 +181,7 @@ class TelegramNotifier:
                     f": {last_error}" if last_error else "",
                     wait,
                 )
-                time.sleep(wait)
+                await asyncio.sleep(wait)
 
         logger.error(
             "Telegram send failed after %d attempts%s",
@@ -199,12 +190,8 @@ class TelegramNotifier:
         )
         return False
 
-    def _post_message(self, text: str) -> bool:
-        """Single HTTP POST to the Telegram Bot API (stdlib urllib).
-
-        Raises an exception on network / HTTP error so the retry loop
-        can back off and re-attempt.
-        """
+    async def _post_message(self, text: str) -> bool:
+        """Single async HTTP POST to the Telegram Bot API."""
         url = TELEGRAM_API.format(token=self.bot_token)
         payload = {
             "chat_id": self.chat_id,
@@ -212,23 +199,19 @@ class TelegramNotifier:
             "parse_mode": "Markdown",
             "disable_web_page_preview": True,
         }
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
+        resp = await self._client.post(
             url,
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+            json=payload,
+            timeout=10.0,
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            body = resp.read()
-            if resp.status == 200:
-                return True
-            logger.warning(
-                "Telegram API returned %d: %s",
-                resp.status,
-                body[:200].decode(errors="replace"),
-            )
-            raise RuntimeError(f"HTTP {resp.status}: {body[:100]!r}")
+        if resp.status_code == 200:
+            return True
+        logger.warning(
+            "Telegram API returned %d: %s",
+            resp.status_code,
+            resp.text[:200],
+        )
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:100]!r}")
 
     @property
     def enabled(self) -> bool:

@@ -1,21 +1,26 @@
-"""Sina Finance (hq.sinajs.cn) quote source — US stocks + A-shares."""
+"""Sina Finance (hq.sinajs.cn) async quote source — US stocks + A-shares."""
 
 from __future__ import annotations
 
 import re
+
+import httpx
 
 from stock_monitor.sources.base import BaseSource, QuoteDict
 from stock_monitor.utils import parse_symbol_market, safe_decode
 
 
 class SinaSource(BaseSource):
-    """Stock quotes via Sina Finance's lightweight text API.
+    """Async stock quotes via Sina Finance's lightweight text API.
 
     Supports both US stocks (``gb_`` prefix) and Chinese A-shares
     (``sh`` / ``sz`` prefix).  Field layout differs by market.
     """
 
     name = "sina"
+
+    def __init__(self, client: httpx.AsyncClient) -> None:
+        super().__init__(client)
 
     def _headers(self) -> dict[str, str]:
         return {

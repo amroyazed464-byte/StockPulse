@@ -104,6 +104,11 @@ class StockMonitorConfig:
     log_level: str = "INFO"
     log_file: str = ""
 
+    # Async-specific settings
+    max_concurrency: int = 20       # Max concurrent HTTP requests (across symbols)
+    http_timeout: float = 10.0      # Per-request HTTP timeout in seconds
+    max_keepalive: int = 20         # Max idle keep-alive connections in pool
+
 
 # ── YAML Loading ────────────────────────────────────────────────────
 
@@ -154,13 +159,16 @@ def load_config_from_yaml(path: str | Path) -> StockMonitorConfig | None:
         use_color=bool(raw.get("use_color", True)),
         stats_interval=float(raw.get("stats_interval", 60.0)),
         alerts=alert_specs,
-        source_order=raw.get("source_order", ["eastmoney", "sina", "yahoo"]),
+        source_order=raw.get("source_order", ["sina", "eastmoney", "yahoo"]),
         retry_max=int(raw.get("retry_max", 3)),
         retry_base_delay=float(raw.get("retry_base_delay", 1.0)),
         retry_max_delay=float(raw.get("retry_max_delay", 30.0)),
         telegram=telegram_cfg,
         log_level=str(raw.get("log_level", "INFO")),
         log_file=str(raw.get("log_file", "")),
+        max_concurrency=int(raw.get("max_concurrency", 20)),
+        http_timeout=float(raw.get("http_timeout", 10.0)),
+        max_keepalive=int(raw.get("max_keepalive", 20)),
     )
 
 

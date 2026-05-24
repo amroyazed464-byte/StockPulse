@@ -1,8 +1,9 @@
-"""Command-line interface — argument parsing and entry point."""
+"""Command-line interface — argument parsing and async entry point."""
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from stock_monitor.config import (
     merge_configs,
 )
 from stock_monitor.logging_setup import setup_logging
-from stock_monitor.monitor import StockMonitor
+from stock_monitor.monitor import AsyncStockMonitor
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -22,8 +23,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="stock-monitor",
         description=(
-            "Real-time stock quote monitor (US + A-share) — polls EastMoney, "
-            "Sina, and Yahoo Finance with optional price alerts and "
+            "Real-time async stock quote monitor (US + A-share) — polls Sina, "
+            "EastMoney, and Yahoo Finance with optional price alerts and "
             "Telegram notifications."
         ),
         epilog=(
@@ -86,6 +87,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Send a test message via Telegram Bot, then exit (requires --telegram)",
     )
     p.add_argument(
+        "--max-concurrency", type=int, default=None, dest="max_concurrency",
+        help="Max concurrent HTTP requests (default: 20)",
+    )
+    p.add_argument(
         "--version", action="version",
         version=f"stock-monitor v{__version__}",
         help="Show version and exit",
@@ -106,16 +111,13 @@ def main(argv: list[str] | None = None) -> None:
         except ImportError:
             pass
 
-    # ── Logging (set up early so config-loading messages are formatted) ─
-
+    # ── Logging (set up early) ──────────────────────────────────────
     setup_logging(
         level=args.log_level or "INFO",
         log_file=args.log_file or "",
     )
 
-    # ── Config loading (layered: defaults → YAML → CLI) ─────────
-
-    # Determine YAML config path
+    # ── Config loading (layered: defaults → YAML → CLI) ─────────────
     yaml_path = args.config
     if yaml_path is None:
         default_yaml = Path("config.yaml")
@@ -127,86 +129,76 @@ def main(argv: list[str] | None = None) -> None:
         yaml_config = load_config_from_yaml(yaml_path)
 
     cli_config = load_config_from_args(args)
+    config = merge_configs(yaml_config, cli_config) if yaml_config is not None else cli_config
 
-    if yaml_config is not None:
-        config = merge_configs(yaml_config, cli_config)
-    else:
-        config = cli_config
-
-    # ── Override with raw CLI args that don't fit dataclass flow ─
-
+    # ── Override with raw CLI args that don't fit dataclass flow ────
     if args.symbols is not None:
         config.symbols = [s.strip().upper()
                           for s in args.symbols.split(",") if s.strip()]
-
     if args.csv is not None:
         config.csv_path = args.csv
-
     if args.json is not None:
         config.json_path = args.json
-
     if args.interval is not None:
         config.interval = args.interval
-
     if args.no_color:
         config.use_color = False
-
     if args.log_level is not None:
         config.log_level = args.log_level
-
     if args.log_file is not None:
         config.log_file = args.log_file
-
     if args.telegram is not None:
         config.telegram.enabled = args.telegram
+    if args.max_concurrency is not None:
+        config.max_concurrency = args.max_concurrency
 
-    # ── Logging (re-apply with final merged config) ─────────────
+    # ── Logging (re-apply with final merged config) ─────────────────
+    setup_logging(level=config.log_level, log_file=config.log_file)
 
-    setup_logging(
-        level=config.log_level,
-        log_file=config.log_file,
-    )
-
-    # ── Test Telegram ───────────────────────────────────────────
-
+    # ── Test Telegram ───────────────────────────────────────────────
     if args.test_telegram:
-        _run_telegram_test(config)
+        asyncio.run(_run_telegram_test_async(config))
         return
 
-    # ── Run ─────────────────────────────────────────────────────
+    # ── Run async monitor ───────────────────────────────────────────
+    monitor = AsyncStockMonitor(config)
+    try:
+        asyncio.run(monitor.run())
+    except KeyboardInterrupt:
+        pass  # Graceful — handled internally by shutdown event
 
-    monitor = StockMonitor(config)
-    monitor.run()
 
-
-def _run_telegram_test(config: StockMonitorConfig) -> None:
+async def _run_telegram_test_async(config: StockMonitorConfig) -> None:
     """Send a test message via Telegram Bot and print the result."""
     from stock_monitor.notifiers.telegram import TelegramNotifier
 
     tg_config = config.telegram
     if not tg_config.bot_token or not tg_config.chat_id:
-        print("[FAIL] Telegram bot_token 或 chat_id 未配置，请在 config.yaml 中填写。")
-        print("       获取方式参考 README.md 中的 Telegram 配置说明。")
+        print("[FAIL] Telegram bot_token or chat_id not configured.")
+        print("       Please fill them in config.yaml.")
         return
 
-    tg = TelegramNotifier(
-        bot_token=tg_config.bot_token,
-        chat_id=tg_config.chat_id,
-        cooldown_seconds=0,  # no cooldown for test
-    )
+    import httpx
 
-    print(f"Bot Token: {tg_config.bot_token[:10]}...{tg_config.bot_token[-4:]}")
-    print(f"Chat ID  : {tg_config.chat_id}")
-    print("正在发送测试消息...")
-    ok = tg.send_test()
-    if ok:
-        print("[OK] 测试消息发送成功！请检查您的 Telegram 对话。")
-    else:
-        print("[FAIL] 测试消息发送失败，请检查 Bot Token 和 Chat ID 是否正确。")
-        print("       常见问题：")
-        print("       1. Bot Token 是否从 @BotFather 正确复制？")
-        print("       2. 是否已在 Telegram 中向您的 Bot 发送过 /start？")
-        print("       3. Chat ID 是否正确？（私聊通常是纯数字，群组以 - 开头）")
+    async with httpx.AsyncClient() as client:
+        tg = TelegramNotifier(
+            client,
+            bot_token=tg_config.bot_token,
+            chat_id=tg_config.chat_id,
+            cooldown_seconds=0,
+        )
+        print(f"Bot Token: {tg_config.bot_token[:10]}...{tg_config.bot_token[-4:]}")
+        print(f"Chat ID  : {tg_config.chat_id}")
+        print("Sending test message...")
+        ok = await tg.send_test()
+        if ok:
+            print("[OK] Test message sent! Check your Telegram.")
+        else:
+            print("[FAIL] Test message failed. Check Bot Token and Chat ID.")
+            print("       Common issues:")
+            print("       1. Did you copy the Bot Token correctly from @BotFather?")
+            print("       2. Have you sent /start to your Bot on Telegram?")
+            print("       3. Is the Chat ID correct?")
 
 
 if __name__ == "__main__":

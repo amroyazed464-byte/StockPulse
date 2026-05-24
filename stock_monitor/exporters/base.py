@@ -1,4 +1,8 @@
-"""Abstract base class for quote exporters."""
+"""Abstract base class for quote exporters.
+
+Exporters perform fast synchronous file writes — they do NOT need to be
+async because the data volume is low and writes complete in microseconds.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +14,8 @@ class BaseExporter(ABC):
     """Abstract exporter for stock quotes.
 
     Subclasses implement ``open``, ``write``, and ``close``.
+    Writes are synchronous (fast file I/O) and should be called from
+    the main async context without ``await``.
     """
 
     @abstractmethod

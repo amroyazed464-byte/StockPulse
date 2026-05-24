@@ -1,8 +1,15 @@
-"""Yahoo Finance (via yfinance) source — fallback when Chinese APIs are down."""
+"""Yahoo Finance (via yfinance) async source — fallback when Chinese APIs are down.
+
+The ``yfinance`` library is synchronous, so we wrap calls in
+``asyncio.to_thread()`` to avoid blocking the event loop.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import logging
+
+import httpx
 
 from stock_monitor.sources.base import BaseSource, QuoteDict
 from stock_monitor.utils import parse_symbol_market
@@ -11,22 +18,18 @@ logger = logging.getLogger("stock_monitor.sources.yahoo")
 
 
 class YahooSource(BaseSource):
-    """US stock quotes via Yahoo Finance (yfinance library).
+    """Async US stock quotes via Yahoo Finance (yfinance library).
 
-    This is a fallback source; its ``fetch()`` returns None immediately
-    if ``yfinance`` is not installed.
+    Wraps the synchronous ``yfinance`` calls with ``asyncio.to_thread()``
+    so they don't block the event loop.  Falls back immediately if
+    ``yfinance`` is not installed.
     """
 
     name = "yahoo"
     _available: bool
 
-    def __init__(
-        self,
-        max_retries: int = 3,
-        base_delay: float = 1.0,
-        max_delay: float = 30.0,
-    ) -> None:
-        super().__init__(max_retries, base_delay, max_delay)
+    def __init__(self, client: httpx.AsyncClient) -> None:
+        super().__init__(client)
         try:
             import yfinance  # noqa: F401
             self._available = True
@@ -38,20 +41,19 @@ class YahooSource(BaseSource):
         return self._available
 
     def _build_url(self, symbol: str) -> str:
-        # yfinance doesn't use URLs directly
-        return ""
+        return ""  # yfinance doesn't use URLs
 
     def _parse_response(self, raw: bytes, symbol: str) -> QuoteDict | None:
-        # Not used — we override fetch() directly
-        return None
+        return None  # unused — fetch() is overridden
 
-    def fetch(self, symbol: str) -> QuoteDict | None:
-        """Fetch via yfinance. Overrides the template to bypass URL-based flow."""
+    async def fetch(self, symbol: str) -> QuoteDict | None:
+        """Fetch via yfinance. Wraps sync calls in ``to_thread``."""
         if not self._available:
             return None
-        return self._do_fetch(symbol)
+        return await asyncio.to_thread(self._sync_fetch, symbol)
 
-    def _do_fetch(self, symbol: str) -> QuoteDict | None:
+    def _sync_fetch(self, symbol: str) -> QuoteDict | None:
+        """Synchronous fetch worker for yfinance (runs in a thread)."""
         import time as _time
         import random as _random
 
@@ -95,6 +97,7 @@ class YahooSource(BaseSource):
                     source="yahoo",
                     market=market,
                 )
+
             except Exception as exc:
                 if attempt < self.max_retries - 1:
                     wait = min(self.base_delay * (2 ** attempt), self.max_delay)

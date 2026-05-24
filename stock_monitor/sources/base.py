@@ -1,10 +1,15 @@
-"""Abstract base class for stock quote data sources."""
+"""Abstract base class for async stock quote data sources."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import random as _random
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING
+
+import httpx
+from typing import TypedDict
 
 if TYPE_CHECKING:
     from typing import NotRequired
@@ -31,27 +36,31 @@ class QuoteDict(TypedDict, total=False):
 
 
 class BaseSource(ABC):
-    """Abstract base for stock quote data sources.
+    """Abstract base for async stock quote data sources.
 
-    Subclasses must implement ``_build_url()`` and ``_parse_response()``.
-    The ``fetch()`` method provides exponential-backoff retry automatically.
+    Subclasses implement ``_build_url()`` and ``_parse_response()``.
+    ``fetch()`` provides async exponential-backoff retry using the shared
+    ``httpx.AsyncClient``.
     """
 
     name: str = "base"
+    _client: httpx.AsyncClient
     _logger: logging.Logger
 
     def __init__(
         self,
+        client: httpx.AsyncClient,
         max_retries: int = 3,
         base_delay: float = 1.0,
         max_delay: float = 30.0,
     ) -> None:
+        self._client = client
         self.max_retries = max_retries
         self.base_delay = base_delay
         self.max_delay = max_delay
         self._logger = logging.getLogger(f"stock_monitor.sources.{self.name}")
 
-    # ── Subclass contract ───────────────────────────────────────
+    # ── Subclass contract ────────────────────────────────────────────
 
     @abstractmethod
     def _build_url(self, symbol: str) -> str:
@@ -64,82 +73,63 @@ class BaseSource(ABC):
         ...
 
     def _is_available(self) -> bool:
-        """Override to return False if the source cannot be used (e.g.
-        missing optional dependency)."""
+        """Override to return False if the source cannot be used."""
         return True
 
-    # ── Public API ──────────────────────────────────────────────
+    # ── Public API ───────────────────────────────────────────────────
 
-    def fetch(self, symbol: str) -> QuoteDict | None:
-        """Fetch a quote for *symbol* with automatic retry on failure.
-
-        Returns:
-            A ``QuoteDict`` on success, or ``None`` if all retries fail
-            or the source is unavailable.
-        """
+    async def fetch(self, symbol: str) -> QuoteDict | None:
+        """Fetch a quote for *symbol* with async retry on failure."""
         if not self._is_available():
             return None
-        return self._fetch_with_retry(symbol)
+        return await self._fetch_with_retry(symbol)
 
-    # ── Internal ────────────────────────────────────────────────
+    # ── Internal async retry loop ────────────────────────────────────
 
-    def _fetch_with_retry(self, symbol: str) -> QuoteDict | None:
-        """Core fetch loop with exponential backoff.
+    async def _fetch_with_retry(self, symbol: str) -> QuoteDict | None:
+        """Core async fetch loop with exponential backoff.
 
-        Disables scrapling's own retry (``max_retries=1``) so that our
-        backoff strategy is the single source of truth — otherwise the
-        two retry loops multiply (3 × 3 = 9 attempts) with mismatched
-        log formatting.
+        Each subclass uses the shared ``httpx.AsyncClient`` for all HTTP
+        requests.  Retries use ``asyncio.sleep`` so the event loop stays
+        free during backoff.
         """
-        import time as _time
-        import random as _random
-
-        from scrapling import Fetcher
-
-        # Silence scrapling's noisy logger (resets to INFO on first import).
-        # Set to CRITICAL because we handle retries ourselves (retries=1).
-        if not getattr(BaseSource, "_scrapling_silenced", False):
-            _sl = logging.getLogger("scrapling")
-            _sl.setLevel(logging.CRITICAL)
-            for _h in _sl.handlers:
-                _h.setLevel(logging.CRITICAL)
-            BaseSource._scrapling_silenced = True  # type: ignore[attr-defined]
-
         url = self._build_url(symbol)
         headers = self._headers()
 
         for attempt in range(self.max_retries):
             try:
-                resp = Fetcher.get(
+                resp = await self._client.get(
                     url,
                     headers=headers,
-                    stealthy_headers=False,
-                    timeout=8,
-                    retries=1,  # disable scrapling's own retry loop
+                    follow_redirects=True,
                 )
-                result = self._parse_response(resp.body, symbol)
+                result = self._parse_response(resp.content, symbol)
                 if result is not None and result.get("price") is not None:
                     result.setdefault("source", self.name)
                     return result
-                # Response parsed but no valid price — treat as transient
+
+                # Response parsed but no valid price — retry
                 if attempt < self.max_retries - 1:
                     wait = min(self.base_delay * (2 ** attempt), self.max_delay)
                     self._logger.debug(
                         "%s: empty/partial response for %s, retry in %.1fs",
                         self.name, symbol, wait,
                     )
-                    _time.sleep(wait)
-            except Exception as exc:
+                    await asyncio.sleep(wait)
+
+            except (httpx.TimeoutException, httpx.ConnectError,
+                    httpx.RemoteProtocolError, OSError) as exc:
                 if attempt < self.max_retries - 1:
                     wait = min(self.base_delay * (2 ** attempt), self.max_delay)
                     jitter = _random.uniform(0, wait * 0.1)
+                    total_wait = wait + jitter
                     self._logger.debug(
                         "%s fetch failed for %s (attempt %d/%d): %s. "
                         "Retrying in %.1fs",
                         self.name, symbol, attempt + 1, self.max_retries,
-                        exc, wait + jitter,
+                        exc, total_wait,
                     )
-                    _time.sleep(wait + jitter)
+                    await asyncio.sleep(total_wait)
                 else:
                     self._logger.warning(
                         "%s: all %d attempts exhausted for %s: %s",

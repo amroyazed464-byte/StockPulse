@@ -1,25 +1,32 @@
-"""Stock Monitor — real-time multi-stock quote monitoring with alerting.
+"""Stock Monitor — async real-time multi-stock quote monitoring with alerting.
 
-Polls EastMoney, Sina Finance, and Yahoo Finance for US stock data,
+Polls Sina Finance, EastMoney, and Yahoo Finance for stock data,
 with auto-failover, configurable price alerts, and CSV/JSON export.
+
+Fully async architecture using asyncio + httpx for high-concurrency
+monitoring of 100+ symbols.
 
 Usage::
 
-    from stock_monitor import StockMonitor, StockMonitorConfig
+    from stock_monitor import AsyncStockMonitor, StockMonitorConfig
 
     config = StockMonitorConfig(symbols=["NVDA", "AAPL"], interval=2.0)
-    monitor = StockMonitor(config)
-    monitor.run()
+    monitor = AsyncStockMonitor(config)
+    asyncio.run(monitor.run())
 """
 
-__version__ = "2.1.0"
+__version__ = "3.0.0"
 
 from stock_monitor.alerts import AlertCondition, AlertManager
 from stock_monitor.config import AlertSpec, StockMonitorConfig, merge_configs
-from stock_monitor.monitor import StockMonitor
+from stock_monitor.monitor import AsyncStockMonitor
+
+# Backward-compat alias
+StockMonitor = AsyncStockMonitor
 
 __all__ = [
-    "StockMonitor",
+    "AsyncStockMonitor",
+    "StockMonitor",    # backward-compat alias
     "StockMonitorConfig",
     "AlertSpec",
     "AlertCondition",

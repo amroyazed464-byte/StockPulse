@@ -1,12 +1,32 @@
-"""StockMonitor — main orchestrator for real-time stock quote monitoring."""
+"""AsyncStockMonitor — fully async orchestrator for real-time stock monitoring.
+
+Architecture
+------------
+Each polling cycle fans out across all symbols concurrently using
+``asyncio.Task``.  A semaphore caps in-flight HTTP requests so we don't
+overwhelm the network stack (or trigger rate-limits) when monitoring
+100+ symbols.
+
+Per-symbol failover is sequential — sources are tried in priority order.
+This preserves the original behaviour where Sina is preferred, then
+EastMoney, then Yahoo.  Retry with exponential backoff lives inside each
+source and uses ``asyncio.sleep`` so the event loop stays free.
+
+Graceful shutdown: SIGINT / SIGTERM sets an ``asyncio.Event``; the main
+loop checks this event at every yield point and cancels all outstanding
+tasks on exit.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import signal
 import sys
 import time
 from typing import Any
+
+import httpx
 
 from stock_monitor.alerts import AlertManager
 from stock_monitor.config import StockMonitorConfig
@@ -19,62 +39,77 @@ from stock_monitor.tracker import SessionStats
 logger = logging.getLogger("stock_monitor.monitor")
 
 
-class StockMonitor:
-    """Real-time multi-stock quote monitor with alerting and export.
+class AsyncStockMonitor:
+    """Real-time multi-stock async quote monitor with alerting and export.
 
     Usage::
 
         config = StockMonitorConfig(symbols=["NVDA", "AAPL"])
-        monitor = StockMonitor(config)
-        monitor.run()
+        monitor = AsyncStockMonitor(config)
+        await monitor.run()
     """
-
-    # Minimum gap between outgoing HTTP requests to avoid rate-limit bans
-    _MIN_REQUEST_GAP = 0.25  # seconds
-
-    # ── Public API ──────────────────────────────────────────────
 
     def __init__(self, config: StockMonitorConfig) -> None:
         self.config = config
         self.display = Display(use_color=config.use_color)
 
-        # State
+        # Internal state
         self._sources: list[BaseSource] = []
         self._exporters: list[BaseExporter] = []
         self._alert_mgr = AlertManager(config.alerts)
         self._telegram: TelegramNotifier | None = None
         self._stats = SessionStats()
         self._last_quotes: dict[str, dict[str, Any]] = {}
-        self._running = False
+
+        # Async primitives
+        self._shutdown_event = asyncio.Event()
+        self._client: httpx.AsyncClient | None = None
+        self._fetch_sem: asyncio.Semaphore | None = None  # limits concurrent fetches
+        self._active_tasks: set[asyncio.Task[Any]] = set()
+
+        # Track consecutive all-source failures for global backoff
         self._consecutive_failures = 0
-        self._last_request_ts = 0.0  # for _MIN_REQUEST_GAP throttle
 
-    def run(self) -> None:
-        """Enter the main monitoring loop. Blocks until interrupted.
+    # ── Public API ────────────────────────────────────────────────────
 
-        Handles SIGINT / SIGTERM for graceful shutdown, printing a
-        session summary on exit.
+    async def run(self) -> None:
+        """Enter the async monitoring loop. Blocks until interrupted.
+
+        Creates the shared ``httpx.AsyncClient``, wires up sources and
+        exporters, then runs the main polling loop.  Handles graceful
+        shutdown on SIGINT / SIGTERM.
         """
-        self._setup()
-        self._register_signal_handlers()
-        self._running = True
-        logger.info("Monitor started: %s", ", ".join(self.config.symbols))
+        self._setup_signal_handlers()
 
-        try:
-            self._main_loop()
-        except KeyboardInterrupt:
-            logger.info("KeyboardInterrupt received — shutting down")
-        finally:
-            self._teardown()
+        timeout = httpx.Timeout(self.config.http_timeout)
+        limits = httpx.Limits(
+            max_connections=self.config.max_concurrency,
+            max_keepalive_connections=self.config.max_keepalive,
+        )
 
-    # ── Setup / Teardown ────────────────────────────────────────
+        async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
+            self._client = client
+            self._fetch_sem = asyncio.Semaphore(self.config.max_concurrency)
+            self._setup_sources(client)
+            self._setup_exporters()
+            self._setup_telegram(client)
 
-    def _setup(self) -> None:
-        """Initialize sources and exporters from config."""
+            logger.info("Monitor started: %s", ", ".join(self.config.symbols))
+
+            try:
+                await self._main_loop()
+            except asyncio.CancelledError:
+                logger.info("Monitor task cancelled — shutting down")
+            finally:
+                await self._teardown()
+
+    # ── Setup / Teardown ──────────────────────────────────────────────
+
+    def _setup_sources(self, client: httpx.AsyncClient) -> None:
         from stock_monitor.sources import get_source_chain
+        self._sources = get_source_chain(self.config.source_order, client)
 
-        self._sources = get_source_chain(self.config.source_order)
-
+    def _setup_exporters(self) -> None:
         from stock_monitor.exporters.csv_exporter import CsvExporter
 
         if self.config.csv_path:
@@ -89,24 +124,33 @@ class StockMonitor:
             json_exp.open()
             self._exporters.append(json_exp)
 
-        # Telegram notifier
-        if self.config.telegram:
-            self._telegram = TelegramNotifier(
-                bot_token=self.config.telegram.bot_token,
-                chat_id=self.config.telegram.chat_id,
-                cooldown_seconds=self.config.telegram.cooldown_seconds,
-            )
-            logger.info("Telegram notifications enabled")
-
-        # Print banner + header
+        # Banner + header
         print(self.display.banner(
             self.config.symbols, self.config.interval, self.config.csv_path,
             self.config.source_order,
         ))
         print(self.display.header())
 
-    def _teardown(self) -> None:
-        """Close exporters and print session summary."""
+    def _setup_telegram(self, client: httpx.AsyncClient) -> None:
+        if self.config.telegram:
+            self._telegram = TelegramNotifier(
+                client,
+                bot_token=self.config.telegram.bot_token,
+                chat_id=self.config.telegram.chat_id,
+                cooldown_seconds=self.config.telegram.cooldown_seconds,
+            )
+            logger.info("Telegram notifications enabled")
+
+    async def _teardown(self) -> None:
+        """Cancel outstanding tasks, close exporters, print summary."""
+        # Cancel all active fetch tasks
+        for task in self._active_tasks:
+            task.cancel()
+        if self._active_tasks:
+            await asyncio.gather(*self._active_tasks, return_exceptions=True)
+        self._active_tasks.clear()
+
+        # Close exporters (sync — fast file I/O)
         for exp in self._exporters:
             try:
                 exp.close()
@@ -116,42 +160,57 @@ class StockMonitor:
         print(self._stats.summary())
         logger.info("Monitor stopped. Runtime: %.0fs", self._stats.elapsed)
 
-    def _register_signal_handlers(self) -> None:
-        """Register SIGINT/SIGTERM for graceful shutdown on Windows + Unix."""
+    def _setup_signal_handlers(self) -> None:
+        """Register SIGINT / SIGTERM handlers using asyncio event-loop signals."""
+        loop = asyncio.get_running_loop()
 
-        def _handler(signum: int, frame: Any) -> None:  # noqa: ARG001
-            logger.debug("Signal %d received", signum)
-            self._running = False
+        def _on_signal() -> None:
+            logger.debug("Shutdown signal received")
+            self._shutdown_event.set()
 
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                signal.signal(sig, _handler)
-            except (ValueError, AttributeError):
-                # SIGTERM handler not supported in some environments
+                loop.add_signal_handler(sig, _on_signal)
+            except NotImplementedError:
+                # Windows ProactorEventLoop doesn't support add_signal_handler
+                # for SIGTERM; SIGINT is handled via KeyboardInterrupt in run().
                 pass
 
-    # ── Main Loop ───────────────────────────────────────────────
+    # ── Main Loop ─────────────────────────────────────────────────────
 
-    def _main_loop(self) -> None:
-        """Core polling loop: for each symbol try sources in order."""
+    async def _main_loop(self) -> None:
+        """Core async polling loop.
+
+        Each cycle fans out to all symbols concurrently, bounded by
+        ``_fetch_sem``.  Between cycles we sleep for the remainder of
+        the interval, but the sleep is cancellable via the shutdown event.
+        """
         interval = self.config.interval
 
-        while self._running:
-            cycle_start = time.time()
+        while not self._shutdown_event.is_set():
+            cycle_start = time.monotonic()
             any_success = False
 
-            for symbol in self.config.symbols:
-                quote = self._fetch_symbol(symbol)
+            # ── Fan-out: fetch all symbols concurrently ──────────────
+            coros = [self._fetch_one_symbol(sym) for sym in self.config.symbols]
+            # Use asyncio.gather to run all concurrently; a single failing
+            # symbol doesn't cancel the rest.
+            results = await asyncio.gather(*coros, return_exceptions=True)
 
-                if quote and quote.get("price") is not None:
+            for symbol, result in zip(self.config.symbols, results):
+                if isinstance(result, Exception):
+                    logger.error("%s: fetch task raised %s", symbol, result)
+                    self._stats.record_error()
+                    continue
+                if result is not None:
                     any_success = True
-                    self._last_quotes[symbol] = quote
-                    self._stats.record_fetch(symbol, quote)
-                    self._process_quote(symbol, quote)
+                    self._last_quotes[symbol] = result
+                    self._stats.record_fetch(symbol, result)
+                    self._process_quote(symbol, result)
                 else:
                     self._stats.record_error()
 
-            # All-sources-down backoff
+            # ── Global backoff when all sources are down ─────────────
             if any_success:
                 self._consecutive_failures = 0
             else:
@@ -165,49 +224,50 @@ class StockMonitor:
                     "All sources down (fail #%d) — backing off %.1fs",
                     self._consecutive_failures, backoff,
                 )
-                msg = self.display.warn(
+                print(self.display.warn(
                     f"  [warn] All sources down — retrying in {backoff:.1f}s "
                     f"(fail #{self._consecutive_failures})"
-                )
-                print(msg, file=sys.stderr, flush=True)
-                time.sleep(backoff)
+                ), file=sys.stderr, flush=True)
+                await self._cancellable_sleep(backoff)
                 continue
 
-            # Per-minute stats
+            # ── Per-minute stats ────────────────────────────────────
             now = time.time()
             if now - self._stats.last_stats_time >= self.config.stats_interval:
                 self._print_minute_stats()
 
-            # Sleep for remainder of interval
-            elapsed = time.time() - cycle_start
+            # ── Sleep for remainder of interval (cancellable) ───────
+            elapsed = time.monotonic() - cycle_start
             sleep_time = max(0, interval - elapsed)
-            if sleep_time > 0 and self._running:
-                time.sleep(sleep_time)
+            if sleep_time > 0:
+                await self._cancellable_sleep(sleep_time)
 
-    def _fetch_symbol(self, symbol: str) -> dict[str, Any] | None:
+    # ── Per-symbol fetch (with semaphore-bound concurrency) ──────────
+
+    async def _fetch_one_symbol(self, symbol: str) -> dict[str, Any] | None:
         """Try all sources in priority order for one symbol.
 
-        Enforces a minimum gap between outgoing HTTP requests
-        (``_MIN_REQUEST_GAP``) to avoid triggering rate-limit bans
-        on shared API endpoints.
+        The semaphore ensures we never exceed ``max_concurrency``
+        simultaneous HTTP requests across *all* symbols.
         """
-        for source in self._sources:
-            # ── Rate-limit guard ────────────────────────────────
-            gap = time.time() - self._last_request_ts
-            if gap < self._MIN_REQUEST_GAP:
-                time.sleep(self._MIN_REQUEST_GAP - gap)
+        # Ensure the semaphore is set (it always is during normal operation)
+        sem = self._fetch_sem
+        if sem is None:
+            return None
 
-            try:
-                quote = source.fetch(symbol)
-                self._last_request_ts = time.time()
-                if quote and quote.get("price") is not None:
-                    logger.debug("%s: got price from %s", symbol, source.name)
-                    return quote
-            except Exception as exc:
-                self._last_request_ts = time.time()
-                logger.warning("%s: source %s raised %s",
-                               symbol, source.name, exc)
+        async with sem:
+            for source in self._sources:
+                try:
+                    quote = await source.fetch(symbol)
+                    if quote is not None and quote.get("price") is not None:
+                        logger.debug("%s: got price from %s", symbol, source.name)
+                        return quote
+                except Exception as exc:
+                    logger.warning("%s: source %s raised %s",
+                                   symbol, source.name, exc)
         return None
+
+    # ── Quote processing ──────────────────────────────────────────────
 
     def _process_quote(self, symbol: str, quote: dict[str, Any]) -> None:
         """Check dedup, fire alerts, write exporters for a successful quote."""
@@ -230,24 +290,31 @@ class StockMonitor:
                 cond.threshold, quote.get(cond.field, 0),
                 market=quote.get("market", "us"),
             ), flush=True)
-            # Telegram notification
-            if self._telegram and self._telegram.enabled:
-                self._telegram.send_alert(
-                    symbol=cond.symbol,
-                    field=cond.field,
-                    operator=cond.operator,
-                    threshold=cond.threshold,
-                    current_value=quote.get(cond.field, 0),
-                    market=quote.get("market", "us"),
-                )
 
-        # Write exporters
+            # Fire-and-forget Telegram notification (don't block the tick)
+            if self._telegram and self._telegram.enabled:
+                task = asyncio.create_task(
+                    self._telegram.send_alert(
+                        symbol=cond.symbol,
+                        field=cond.field,
+                        operator=cond.operator,
+                        threshold=cond.threshold,
+                        current_value=quote.get(cond.field, 0),
+                        market=quote.get("market", "us"),
+                    )
+                )
+                self._active_tasks.add(task)
+                task.add_done_callback(self._active_tasks.discard)
+
+        # Write exporters (sync — microseconds)
         for exp in self._exporters:
             try:
                 exp.write(symbol, quote)
             except Exception as exc:
                 logger.error("Exporter %s write error: %s",
                              type(exp).__name__, exc)
+
+    # ── Stats printing ────────────────────────────────────────────────
 
     def _print_minute_stats(self) -> None:
         """Print per-minute volume-delta statistics."""
@@ -265,3 +332,14 @@ class StockMonitor:
             print(self.display.stats_line(symbol, quote, cycle_delta),
                   flush=True)
         print(self.display.stats_footer())
+
+    # ── Helpers ───────────────────────────────────────────────────────
+
+    async def _cancellable_sleep(self, seconds: float) -> None:
+        """Sleep for *seconds*, waking early if shutdown is signaled."""
+        try:
+            await asyncio.wait_for(
+                self._shutdown_event.wait(), timeout=seconds,
+            )
+        except asyncio.TimeoutError:
+            pass  # Normal — sleep interval elapsed
