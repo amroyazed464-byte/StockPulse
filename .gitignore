@@ -1,0 +1,50 @@
+# ── Python bytecode ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+
+# ── Virtual environments ────────────────────────────────────────
+venv/
+.venv/
+.venv*/
+env/
+.env/
+ENV/
+
+# ── PyInstaller ─────────────────────────────────────────────────
+*.spec
+build/
+dist/
+*.manifest
+
+# ── IDE / Editor ────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS generated ────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ── Project output (runtime artifacts) ──────────────────────────
+*.csv
+*.jsonl
+*.log
+*.log.*
+
+# ── Environment / Secrets ───────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ── User config (contains secrets / credentials) ────────────────
+config.yaml
+
+# ── Distribution ────────────────────────────────────────────────
+*.tar.gz
+*.whl

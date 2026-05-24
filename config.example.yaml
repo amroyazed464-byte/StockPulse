@@ -1,0 +1,81 @@
+# ═══════════════════════════════════════════════════════════════
+# StockPulse — Example Configuration
+# ═══════════════════════════════════════════════════════════════
+# Copy this file to config.yaml and customize.
+#   cp config.example.yaml config.yaml
+#
+# CLI arguments override these values.
+#
+# Usage:
+#   python -m stock_monitor -c config.yaml
+#   python -m stock_monitor -c config.yaml -s NVDA,AAPL,TSLA
+#   python -m stock_monitor -s NVDA,600519.SH --telegram
+
+# ── Stocks to monitor ───────────────────────────────────────────
+# US stocks: NVDA, AAPL, TSLA, MSFT, GOOGL, etc.
+# A-shares:  600519.SH (茅台), 000333.SZ (美的), 000858.SZ (五粮液)
+symbols:
+  - NVDA
+  - AAPL
+
+# ── Polling interval (seconds) ─────────────────────────────────
+interval: 2.0
+
+# ── Per-minute stats interval (seconds) ────────────────────────
+stats_interval: 60.0
+
+# ── Export paths (set to "" to disable) ────────────────────────
+csv_path: stock_ticks.csv
+json_path: ""
+
+# ── Display ────────────────────────────────────────────────────
+use_color: true
+
+# ── Price Alerts ───────────────────────────────────────────────
+# Field: price, change, change_pct, volume
+# Operator: >, <, >=, <=
+# Cooldown: minimum ticks between re-fires
+#
+# US stock example:
+# alerts:
+#   - symbol: NVDA
+#     field: price
+#     operator: ">"
+#     threshold: 230.0
+#     cooldown_ticks: 5
+#
+# A-share example (displays in ￥):
+#   - symbol: 600519.SH
+#     field: price
+#     operator: ">"
+#     threshold: 1800.0
+#     cooldown_ticks: 5
+
+alerts: []
+
+# ── Telegram Bot Notifications ─────────────────────────────────
+# 1. Create a bot with @BotFather to get bot_token
+# 2. Send /start to your bot, then use @userinfobot to get chat_id
+# 3. Fill in below and set enabled: true
+#
+# Or use CLI: --telegram (credentials still required here)
+telegram:
+  bot_token: ""                # from @BotFather
+  chat_id: ""                  # from @userinfobot
+  enabled: false               # true = always on (no --telegram flag needed)
+  cooldown_seconds: 60         # minimum seconds between alerts per rule
+
+# ── Data source priority ────────────────────────────────────────
+source_order:
+  - eastmoney
+  - sina
+  - yahoo
+
+# ── Retry settings ─────────────────────────────────────────────
+retry_max: 3
+retry_base_delay: 1.0
+retry_max_delay: 30.0
+
+# ── Logging ────────────────────────────────────────────────────
+log_level: INFO
+log_file: stock_monitor.log

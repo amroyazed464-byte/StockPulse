@@ -1,0 +1,15 @@
+# StockPulse — Real-time Stock Monitor (US + A-share)
+# =====================================================
+# Core dependencies (required)
+# ----------------------------
+scrapling>=0.4.8,<1.0       # HTTP client with TLS impersonation
+colorama>=0.4.6,<1.0        # ANSI color support on Windows
+
+# Optional dependencies
+# ---------------------
+# pyyaml>=6.0,<7.0          # YAML config file support
+# yfinance>=0.2.0,<1.0      # Yahoo Finance fallback source
+
+# Dev / Build (optional)
+# ----------------------
+# pyinstaller>=6.0,<7.0     # Build standalone .exe
