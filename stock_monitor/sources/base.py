@@ -84,34 +84,39 @@ class BaseSource(ABC):
     # ── Internal ────────────────────────────────────────────────
 
     def _fetch_with_retry(self, symbol: str) -> QuoteDict | None:
-        """Core fetch loop with exponential backoff."""
+        """Core fetch loop with exponential backoff.
+
+        Disables scrapling's own retry (``max_retries=1``) so that our
+        backoff strategy is the single source of truth — otherwise the
+        two retry loops multiply (3 × 3 = 9 attempts) with mismatched
+        log formatting.
+        """
         import time as _time
         import random as _random
 
         from scrapling import Fetcher
 
-        from stock_monitor.utils import safe_decode
-
-        # Scrapling's import chain resets its logger to INFO on first import.
-        # Silence it once per process lifetime.
+        # Silence scrapling's noisy logger (resets to INFO on first import).
+        # Set to CRITICAL because we handle retries ourselves (retries=1).
         if not getattr(BaseSource, "_scrapling_silenced", False):
             _sl = logging.getLogger("scrapling")
-            _sl.setLevel(logging.WARNING)
+            _sl.setLevel(logging.CRITICAL)
             for _h in _sl.handlers:
-                _h.setLevel(logging.WARNING)
+                _h.setLevel(logging.CRITICAL)
             BaseSource._scrapling_silenced = True  # type: ignore[attr-defined]
 
         url = self._build_url(symbol)
+        headers = self._headers()
 
         for attempt in range(self.max_retries):
             try:
                 resp = Fetcher.get(
                     url,
-                    headers=self._headers(),
+                    headers=headers,
                     stealthy_headers=False,
                     timeout=8,
+                    retries=1,  # disable scrapling's own retry loop
                 )
-                text = safe_decode(resp.body)
                 result = self._parse_response(resp.body, symbol)
                 if result is not None and result.get("price") is not None:
                     result.setdefault("source", self.name)

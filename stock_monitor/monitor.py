@@ -29,6 +29,9 @@ class StockMonitor:
         monitor.run()
     """
 
+    # Minimum gap between outgoing HTTP requests to avoid rate-limit bans
+    _MIN_REQUEST_GAP = 0.25  # seconds
+
     # ── Public API ──────────────────────────────────────────────
 
     def __init__(self, config: StockMonitorConfig) -> None:
@@ -44,6 +47,7 @@ class StockMonitor:
         self._last_quotes: dict[str, dict[str, Any]] = {}
         self._running = False
         self._consecutive_failures = 0
+        self._last_request_ts = 0.0  # for _MIN_REQUEST_GAP throttle
 
     def run(self) -> None:
         """Enter the main monitoring loop. Blocks until interrupted.
@@ -97,6 +101,7 @@ class StockMonitor:
         # Print banner + header
         print(self.display.banner(
             self.config.symbols, self.config.interval, self.config.csv_path,
+            self.config.source_order,
         ))
         print(self.display.header())
 
@@ -180,14 +185,26 @@ class StockMonitor:
                 time.sleep(sleep_time)
 
     def _fetch_symbol(self, symbol: str) -> dict[str, Any] | None:
-        """Try all sources in priority order for one symbol."""
+        """Try all sources in priority order for one symbol.
+
+        Enforces a minimum gap between outgoing HTTP requests
+        (``_MIN_REQUEST_GAP``) to avoid triggering rate-limit bans
+        on shared API endpoints.
+        """
         for source in self._sources:
+            # ── Rate-limit guard ────────────────────────────────
+            gap = time.time() - self._last_request_ts
+            if gap < self._MIN_REQUEST_GAP:
+                time.sleep(self._MIN_REQUEST_GAP - gap)
+
             try:
                 quote = source.fetch(symbol)
+                self._last_request_ts = time.time()
                 if quote and quote.get("price") is not None:
                     logger.debug("%s: got price from %s", symbol, source.name)
                     return quote
             except Exception as exc:
+                self._last_request_ts = time.time()
                 logger.warning("%s: source %s raised %s",
                                symbol, source.name, exc)
         return None

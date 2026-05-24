@@ -40,6 +40,7 @@ class AlertSpec:
     _valid_ops = frozenset({">", "<", ">=", "<="})
 
     def __post_init__(self) -> None:
+        self.symbol = self.symbol.strip().upper()
         if self.field not in self._valid_fields:
             raise ValueError(
                 f"Alert field '{self.field}' not in {sorted(self._valid_fields)}"
@@ -94,7 +95,7 @@ class StockMonitorConfig:
     stats_interval: float = 60.0
     alerts: list[AlertSpec] = field(default_factory=list)
     source_order: list[str] = field(
-        default_factory=lambda: ["eastmoney", "sina", "yahoo"]
+        default_factory=lambda: ["sina", "eastmoney", "yahoo"]
     )
     retry_max: int = 3
     retry_base_delay: float = 1.0
@@ -130,6 +131,7 @@ def load_config_from_yaml(path: str | Path) -> StockMonitorConfig | None:
     alert_specs: list[AlertSpec] = []
     for entry in raw.pop("alerts", []) or []:
         entry["source"] = "yaml"
+        entry["symbol"] = str(entry.get("symbol", "")).strip().upper()
         alert_specs.append(AlertSpec(**entry))
 
     # Parse telegram
@@ -141,8 +143,11 @@ def load_config_from_yaml(path: str | Path) -> StockMonitorConfig | None:
         cooldown_seconds=int(tg_raw.get("cooldown_seconds", 60)),
     )
 
+    raw_symbols: list[str] = raw.get("symbols", ["NVDA"])
+    symbols = [s.strip().upper() for s in raw_symbols if s.strip()]
+
     return StockMonitorConfig(
-        symbols=raw.get("symbols", ["NVDA"]),
+        symbols=symbols or ["NVDA"],
         interval=float(raw.get("interval", 2.0)),
         csv_path=str(raw.get("csv_path", "stock_ticks.csv")),
         json_path=str(raw.get("json_path", "")),

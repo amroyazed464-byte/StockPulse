@@ -67,8 +67,8 @@ telegram:
 
 # ── Data source priority ────────────────────────────────────────
 source_order:
-  - eastmoney
   - sina
+  - eastmoney
   - yahoo
 
 # ── Retry settings ─────────────────────────────────────────────

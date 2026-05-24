@@ -1,4 +1,4 @@
-"""Sina Finance (hq.sinajs.cn) US-stock quote source."""
+"""Sina Finance (hq.sinajs.cn) quote source — US stocks + A-shares."""
 
 from __future__ import annotations
 
@@ -9,9 +9,10 @@ from stock_monitor.utils import parse_symbol_market, safe_decode
 
 
 class SinaSource(BaseSource):
-    """US stock quotes via Sina Finance's lightweight text API.
+    """Stock quotes via Sina Finance's lightweight text API.
 
-    Fast and simple, but fewer fields than EastMoney.
+    Supports both US stocks (``gb_`` prefix) and Chinese A-shares
+    (``sh`` / ``sz`` prefix).  Field layout differs by market.
     """
 
     name = "sina"
@@ -23,6 +24,11 @@ class SinaSource(BaseSource):
         }
 
     def _build_url(self, symbol: str) -> str:
+        market, code = parse_symbol_market(symbol)
+        if market == "sh":
+            return f"https://hq.sinajs.cn/list=sh{code}"
+        if market == "sz":
+            return f"https://hq.sinajs.cn/list=sz{code}"
         return f"https://hq.sinajs.cn/list=gb_{symbol.lower()}"
 
     def _parse_response(self, raw: bytes, symbol: str) -> QuoteDict | None:
@@ -43,6 +49,26 @@ class SinaSource(BaseSource):
 
         market, _code = parse_symbol_market(symbol)
 
+        if market in ("sh", "sz"):
+            # A-share format: name, open, prev_close, price, high, low, ...
+            price = _f(3) or 0.0
+            prev = _f(2)
+            change = price - prev if (price and prev) else 0.0
+            change_pct = (change / prev * 100) if prev else 0.0
+            return QuoteDict(
+                price=price,
+                change=change,
+                change_pct=change_pct,
+                open=_f(1),
+                high=_f(4),
+                low=_f(5),
+                volume=int(parts[8]) if len(parts) > 8 and parts[8] else 0,
+                prev_close=prev,
+                source="sina",
+                market=market,
+            )
+
+        # US stock format: name, price, change_pct, ?, change, ?, high, low, ...
         return QuoteDict(
             price=float(parts[1]),
             change_pct=float(parts[2]),

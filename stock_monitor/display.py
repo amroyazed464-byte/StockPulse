@@ -45,15 +45,18 @@ class Display:
     def __init__(self, use_color: bool = True) -> None:
         self.use_color = use_color
 
-    def banner(self, symbols: list[str], interval: float, csv_path: str) -> str:
+    def banner(self, symbols: list[str], interval: float, csv_path: str,
+               source_order: list[str] | None = None) -> str:
         """Return the startup banner string."""
         sym_list = ", ".join(symbols)
         base = f"  {sym_list}  |  {interval}s interval  |  → {csv_path}"
         if self.use_color:
             base = f"{_Color.BOLD}{base}{_Color.RESET}"
+        source_names = [s.capitalize() for s in (source_order or [])]
+        sources_str = " / ".join(source_names) if source_names else "Auto"
         lines = [
             f"\n{base}",
-            "  Sources: EastMoney / Sina / Yahoo",
+            f"  Sources: {sources_str}",
         ]
         running = "  Running...  Ctrl+C to exit"
         if self.use_color:
