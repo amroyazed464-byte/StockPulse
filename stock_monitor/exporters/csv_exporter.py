@@ -1,14 +1,17 @@
-"""CSV exporter for stock quotes."""
+"""CSV exporter — event-driven via PriceUpdateEvent subscription."""
 
 from __future__ import annotations
 
 import csv
 import logging
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from stock_monitor.exporters.base import BaseExporter
 from stock_monitor.utils import fmt_ts
+
+if TYPE_CHECKING:
+    from stock_monitor.events import EventBus, PriceUpdateEvent
 
 logger = logging.getLogger("stock_monitor.exporters.csv")
 
@@ -24,14 +27,16 @@ CSV_FIELDS = [
 class CsvExporter(BaseExporter):
     """Append-mode CSV writer using ``csv.DictWriter``.
 
-    A header row is written automatically when the file is new or empty.
-    Every ``write()`` call is flushed immediately for crash safety.
+    Subscribes to ``PriceUpdateEvent`` so every price tick is recorded
+    automatically.  A header row is written when the file is new or empty.
     """
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self._file: Any = None
         self._writer: csv.DictWriter | None = None
+
+    # ── Lifecycle ─────────────────────────────────────────────────
 
     def open(self) -> None:
         needs_header = not self.path.exists() or self.path.stat().st_size == 0
@@ -41,6 +46,26 @@ class CsvExporter(BaseExporter):
             self._writer.writeheader()
             self._file.flush()
         logger.info("CSV exporter opened: %s", self.path)
+
+    def close(self) -> None:
+        if self._file:
+            self._file.close()
+            self._file = None
+            self._writer = None
+
+    # ── Event bus wiring ──────────────────────────────────────────
+
+    def wire(self, bus: EventBus) -> None:
+        """Subscribe to price updates. Call once during setup."""
+        from stock_monitor.events import PriceUpdateEvent
+
+        bus.subscribe(PriceUpdateEvent, self._on_price_update)
+
+    async def _on_price_update(self, event: PriceUpdateEvent) -> None:
+        """Write a row to CSV for every price update."""
+        self.write(event.symbol, event.quote)
+
+    # ── Core write ────────────────────────────────────────────────
 
     def write(self, symbol: str, quote: dict[str, Any]) -> None:
         if self._writer is None:
@@ -61,12 +86,6 @@ class CsvExporter(BaseExporter):
         }
         self._writer.writerow(row)
         self._file.flush()  # type: ignore[union-attr]
-
-    def close(self) -> None:
-        if self._file:
-            self._file.close()
-            self._file = None
-            self._writer = None
 
 
 def _fmt(val: Any) -> str:

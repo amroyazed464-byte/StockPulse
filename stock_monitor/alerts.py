@@ -1,12 +1,19 @@
-"""Price alert system with cooldown to prevent console spam."""
+"""Price alert system — event-driven with publish/subscribe.
+
+AlertManager subscribes to ``PriceUpdateEvent`` and publishes
+``AlertTriggeredEvent`` when thresholds are crossed.
+"""
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from stock_monitor.config import AlertSpec
+
+if TYPE_CHECKING:
+    from stock_monitor.events import EventBus, PriceUpdateEvent
 
 logger = logging.getLogger("stock_monitor.alerts")
 
@@ -41,7 +48,6 @@ class AlertCondition:
         """Check if the alert condition is met for a quote.
 
         Returns True only on a *new* crossing (rising edge).
-        Once triggered, the condition must re-arm before it fires again.
         """
         value = quote.get(self.field)
         if value is None:
@@ -79,14 +85,16 @@ class AlertCondition:
 
 
 class AlertManager:
-    """Manages a collection of alert conditions and checks quotes against them.
+    """Event-driven price alert engine.
+
+    Subscribes to ``PriceUpdateEvent`` via the bus.  When a threshold is
+    crossed, publishes ``AlertTriggeredEvent`` so display and notifiers
+    can react independently.
 
     Usage::
 
         mgr = AlertManager(config.alerts)
-        for symbol, quote in fetch_loop():
-            for triggered in mgr.check(symbol, quote):
-                print(display.alert(triggered, quote))
+        mgr.wire(bus)  # subscribes to PriceUpdateEvent
     """
 
     def __init__(self, specs: list[AlertSpec]) -> None:
@@ -100,12 +108,36 @@ class AlertManager:
                 cooldown_ticks=spec.cooldown_ticks,
                 source=spec.source,
             ))
+        self._bus: EventBus | None = None
         logger.debug("Loaded %d alert conditions", len(self._conditions))
 
-    def check(self, symbol: str, quote: dict[str, Any]) -> list[AlertCondition]:
-        """Evaluate all alert conditions for *symbol* against *quote*.
+    # ── Event bus wiring ────────────────────────────────────────
 
-        Returns a list of newly-triggered conditions (empty if none).
+    def wire(self, bus: EventBus) -> None:
+        """Subscribe to events. Call once during setup."""
+        from stock_monitor.events import PriceUpdateEvent
+
+        self._bus = bus
+        bus.subscribe(PriceUpdateEvent, self._on_price_update)
+
+    # ── Event handler ───────────────────────────────────────────
+
+    async def _on_price_update(self, event: PriceUpdateEvent) -> None:
+        """Check all alert conditions for a price update and publish triggers."""
+        if self._bus is None:
+            return
+        triggered = self.check(event.symbol, event.quote)
+        for cond in triggered:
+            await self._bus.publish(
+                _build_alert_triggered(cond, event)
+            )
+
+    # ── Core logic (kept sync — pure CPU, called from async handler) ─
+
+    def check(self, symbol: str, quote: dict[str, Any]) -> list[AlertCondition]:
+        """Evaluate alert conditions for *symbol* against *quote*.
+
+        Returns newly-triggered conditions.
         """
         triggered: list[AlertCondition] = []
         for cond in self._conditions:
@@ -128,7 +160,6 @@ class AlertManager:
 
         condition_met = op_fn(value, cond.threshold)
 
-        # Fresh trigger
         if condition_met and not cond.triggered:
             cond.triggered = True
             cond._ticks_since_trigger = 0
@@ -139,12 +170,10 @@ class AlertManager:
             )
             return True
 
-        # Re-arm when threshold no longer met
         if not condition_met:
             cond.triggered = False
             return False
 
-        # Still triggered — check cooldown for re-fire
         cond._ticks_since_trigger += 1
         if cond.cooldown_expired():
             cond._ticks_since_trigger = 0
@@ -157,24 +186,24 @@ class AlertManager:
 
         return False
 
-    def format_alert(self, spec: AlertSpec, quote: dict[str, Any]) -> str:
-        """Build a human-readable alert message from an AlertSpec and quote."""
-        value = quote.get(spec.field, "?")
-        if spec.field == "price":
-            val_s = f"${value:.2f}"
-            thr_s = f"${spec.threshold:.2f}"
-        elif spec.field == "change_pct":
-            val_s = f"{value:+.2f}%"
-            thr_s = f"{spec.threshold:+.2f}%"
-        else:
-            val_s = f"{value}"
-            thr_s = f"{spec.threshold}"
-        return (
-            f"ALERT: {spec.symbol} {spec.field} {val_s} "
-            f"{spec.operator} {thr_s}"
-        )
+    # ── Helpers ─────────────────────────────────────────────────
 
     @property
     def conditions(self) -> list[AlertCondition]:
         """Read-only view of all alert conditions."""
         return list(self._conditions)
+
+
+def _build_alert_triggered(cond: AlertCondition,
+                           event: Any) -> Any:
+    """Build an AlertTriggeredEvent from a condition and the source quote event."""
+    from stock_monitor.events import AlertTriggeredEvent
+
+    return AlertTriggeredEvent(
+        symbol=cond.symbol,
+        field=cond.field,
+        operator=cond.operator,
+        threshold=cond.threshold,
+        current_value=event.quote.get(cond.field, 0),
+        market=event.quote.get("market", "us"),
+    )

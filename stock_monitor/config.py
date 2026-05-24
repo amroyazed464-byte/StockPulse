@@ -109,6 +109,14 @@ class StockMonitorConfig:
     http_timeout: float = 10.0      # Per-request HTTP timeout in seconds
     max_keepalive: int = 20         # Max idle keep-alive connections in pool
 
+    # Volume spike detection
+    volume_spike_window: int = 20   # Rolling window size for volume SMA
+    volume_spike_ratio: float = 3.0  # Multiplier over SMA to trigger spike event
+
+    # Plugin system
+    disabled_plugins: list[str] = field(default_factory=list)
+    plugin_paths: list[str] = field(default_factory=list)
+
 
 # ── YAML Loading ────────────────────────────────────────────────────
 
@@ -169,6 +177,10 @@ def load_config_from_yaml(path: str | Path) -> StockMonitorConfig | None:
         max_concurrency=int(raw.get("max_concurrency", 20)),
         http_timeout=float(raw.get("http_timeout", 10.0)),
         max_keepalive=int(raw.get("max_keepalive", 20)),
+        volume_spike_window=int(raw.get("volume_spike_window", 20)),
+        volume_spike_ratio=float(raw.get("volume_spike_ratio", 3.0)),
+        disabled_plugins=raw.get("disabled_plugins", []),
+        plugin_paths=raw.get("plugin_paths", []),
     )
 
 

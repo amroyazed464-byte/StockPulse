@@ -1,12 +1,19 @@
-"""Per-symbol and session-wide statistics tracking."""
+"""Per-symbol and session-wide statistics tracking — event-driven.
+
+SessionStats subscribes to ``PriceUpdateEvent`` to accumulate session
+data.  Per-minute volume deltas are now tracked via the event bus.
+"""
 
 from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from stock_monitor.utils import fmt_duration
+
+if TYPE_CHECKING:
+    from stock_monitor.events import EventBus, PriceUpdateEvent
 
 logger = logging.getLogger("stock_monitor.tracker")
 
@@ -42,7 +49,11 @@ class SymbolTracker:
 
 
 class SessionStats:
-    """Aggregate session statistics across all symbols."""
+    """Aggregate session statistics — event-driven accumulation.
+
+    Subscribes to ``PriceUpdateEvent`` via ``wire(bus)`` to record
+    ticks and track per-symbol high/low ranges automatically.
+    """
 
     __slots__ = (
         "_start_time", "fetch_count", "tick_count", "error_count",
@@ -58,6 +69,45 @@ class SessionStats:
         self._trackers: dict[str, SymbolTracker] = {}
         self.last_stats_time: float = time.time()
 
+    # ── Event bus wiring ──────────────────────────────────────────
+
+    def wire(self, bus: EventBus) -> None:
+        """Subscribe to price updates and fetch results to accumulate stats."""
+        from stock_monitor.events import FetchCompletedEvent, PriceUpdateEvent
+
+        bus.subscribe(PriceUpdateEvent, self._on_price_update)
+        bus.subscribe(FetchCompletedEvent, self._on_fetch_completed)
+
+    async def _on_price_update(self, event: PriceUpdateEvent) -> None:
+        """Accumulate stats from every price update event."""
+        quote = event.quote
+        tr = self.get_tracker(event.symbol)
+        price = quote["price"]
+        vol = quote.get("volume", 0)
+
+        # Dedup: only record if price or volume changed
+        if price == tr.last_price and vol == tr.last_vol:
+            return
+
+        tr.record_tick(price, vol)
+        tr.update_high_low(price)
+        self.tick_count += 1
+
+    async def _on_fetch_completed(self, event: Any) -> None:
+        """Record fetch/error counts from fetch-completed events."""
+        if event.success:
+            self.fetch_count += 1
+            if event.quote:
+                src = event.quote.get("source", "?")
+                self.source_counts[src] = self.source_counts.get(src, 0) + 1
+                self.get_tracker(event.symbol).update_high_low(
+                    event.quote["price"]
+                )
+        else:
+            self.error_count += 1
+
+    # ── Public tracker API ────────────────────────────────────────
+
     def get_tracker(self, symbol: str) -> SymbolTracker:
         """Return (creating if needed) the per-symbol tracker."""
         if symbol not in self._trackers:
@@ -65,22 +115,17 @@ class SessionStats:
         return self._trackers[symbol]
 
     def record_fetch(self, symbol: str, quote: dict[str, Any]) -> None:
-        """Record a successful API fetch (regardless of dedup)."""
+        """Record a successful API fetch (called by monitor pre-dedup)."""
         self.fetch_count += 1
         src = quote.get("source", "?")
         self.source_counts[src] = self.source_counts.get(src, 0) + 1
         self.get_tracker(symbol).update_high_low(quote["price"])
 
-    def record_tick(self, symbol: str, quote: dict[str, Any]) -> None:
-        """Record a logged tick (price/volume changed)."""
-        self.tick_count += 1
-        self.get_tracker(symbol).record_tick(
-            quote["price"], quote.get("volume", 0)
-        )
-
     def record_error(self) -> None:
         """Record a failed fetch cycle."""
         self.error_count += 1
+
+    # ── Properties ────────────────────────────────────────────────
 
     @property
     def elapsed(self) -> float:
@@ -91,6 +136,8 @@ class SessionStats:
     def trackers(self) -> dict[str, SymbolTracker]:
         """Read-only view of per-symbol trackers."""
         return dict(self._trackers)
+
+    # ── Summary ───────────────────────────────────────────────────
 
     def summary(self) -> str:
         """Build the session summary block for display on exit."""
